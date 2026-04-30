@@ -109,20 +109,98 @@ If the kernel allocates inside the wrapper's `with torch.cuda.use_mem_pool(pool)
 (which it will, since allocations inside the `runpy.run_path` body are
 captured), GSan will see them.
 
-## Running the full pytest sweep (if you really need to)
+## Reproducing the partial sweep (~1460 tests, the SURVEY.md numbers)
 
-It is documented but **expected to mostly fail** on this hardware. See
-`SURVEY.md` numbers. If you want to redo it for a new Triton version:
+The full triton_tests sweep collects ~27666 tests. Under GSan it does **not**
+finish in reasonable time — the dominant failure mode is OOM in the GSan
+private pool (see constraint #2), and each failed test still has to compile
+under instrumentation. The numbers in `SURVEY.md` come from killing the run
+at ~5% progress (~1460 tests). To reproduce that exact recipe:
+
+### Step 1. Bootstrap (must be done in this shell)
+
+```bash
+cd /home/hwu27/workspace/race-detector-experiments
+source .venv/bin/activate
+export PYTHONPATH="$PWD/aiter:$PYTHONPATH"
+```
+
+`PYTHONPATH` is mandatory — AITER is not pip-installed.
+
+### Step 2. Launch the sweep in the background, logging to a file
 
 ```bash
 TRITON_DISABLE_LINE_INFO=0 \
-  python -m pytest -q --tb=no --timeout=300 --timeout-method=thread \
+  python -m pytest -q --no-header --tb=no \
+    --timeout=300 --timeout-method=thread \
     -p no:cacheprovider \
-    aiter/op_tests/triton_tests
+    aiter/op_tests/triton_tests \
+    > /tmp/aiter_gsan_run.log 2>&1 &
+SWEEP_PID=$!
+echo "sweep pid=$SWEEP_PID, log=/tmp/aiter_gsan_run.log"
 ```
 
-The `conftest.py` at repo root supplies a session-scope autouse fixture that
-puts everything inside `with torch.cuda.use_mem_pool(create_mem_pool()):`.
+The `conftest.py` at the repo root supplies a session-scope autouse fixture
+that puts every test inside `with torch.cuda.use_mem_pool(create_mem_pool()):`,
+so GSan is automatically active for the whole sweep.
+
+### Step 3. Wait ~5 minutes and kill at ~5% progress
+
+```bash
+# Peek at progress every minute or so:
+tail -3 /tmp/aiter_gsan_run.log
+
+# When the progress marker (e.g. "[ 5%]") shows ~5%, kill the sweep:
+pkill -f "pytest.*triton_tests"
+# or: kill $SWEEP_PID
+```
+
+The sweep run from `SURVEY.md` was killed at the `[ 5%]` mark and yielded
+**1460 outcome characters** in the log. Killing earlier or later will give
+proportionally fewer/more.
+
+### Step 4. Count outcomes (this is what SURVEY.md tabulates)
+
+```bash
+# Each test contributes one of: . F s E in the progress line
+grep -oE '\.|F|s|E' /tmp/aiter_gsan_run.log | sort | uniq -c
+```
+
+Reference numbers from the original run:
+
+```
+     49 .     # passed   ~3.4%
+   1345 F     # failed   ~94.0%   (overwhelmingly OOM in private pool)
+     66 s     # skipped  ~4.6%
+                                  total = 1460
+```
+
+The ratio is the load-bearing finding — not the absolute count. Same trend
+should hold across kill points and minor Triton/AITER version drift.
+
+### Step 5. (Optional) Confirm a sample failure is OOM, not a real race
+
+```bash
+# Pick any failing test file and re-run with verbose tracebacks (small subset, fast)
+TRITON_DISABLE_LINE_INFO=0 \
+  python -m pytest --no-header --tb=line -q --timeout=60 \
+    aiter/op_tests/triton_tests/test_topk.py 2>&1 | tail -20
+```
+
+Expected: failures show `torch.OutOfMemoryError: CUDA out of memory ... in
+private pools` even though the GPU is mostly free. This is the diagnostic
+signature from `SURVEY.md` — *not* a GSan race report.
+
+### What NOT to do here
+
+- **Don't run without `&` in the foreground.** It will hang the shell
+  for hours; the foreground `pkill` won't fire.
+- **Don't omit `-p no:cacheprovider`** in a shared workspace — pytest cache
+  files inside the aiter submodule will pollute its working tree.
+- **Don't expect 27666 / X% / Y%-style numbers.** The progress percent stops
+  being meaningful once you kill mid-run; report against the 1460 total.
+- **Don't claim "AITER has races detected"** based on this sweep. The 94%
+  failure is allocator-OOM, not race detection.
 
 ## Key files
 

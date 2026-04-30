@@ -1,0 +1,77 @@
+From: race-detector-experiments
+Subject: [experimental] Make AITER importable on a non-ROCm machine
+
+AITER is ROCm-only by design. Three module-load-time barriers stop it from
+even being `import aiter`-able on a CUDA box:
+
+  1. setup.py:148 raises if BUILD_TARGET != "rocm".
+     (We don't pip-install AITER, so this only matters for the optional
+     install fallback. Patched anyway.)
+  2. aiter/jit/utils/cpp_extension.py:169 calls get_hip_version() at module
+     load — raises "ROCm version file not found" on CUDA.
+  3. aiter/__init__.py imports `from .utility import dtypes` *inside* the
+     CK/HIP try block. That try block aborts on `from .jit import core`,
+     so `aiter.dtypes` never gets exposed even though dtypes.py itself only
+     needs torch + a GFX string.
+
+This patch does the minimum to clear all three. Subsequent ROCm assumptions
+deeper in AITER are NOT addressed — many tests will still fail to collect
+on CUDA. This is local-only experimental scaffolding, not an upstream-
+supported AITER CUDA build.
+
+Apply with:
+    cd aiter && git apply ../patches/aiter-cuda-experimental.patch
+
+Pair with environment variable:
+    export GPU_ARCHS=gfx942
+so chip_info.get_gfx() short-circuits past rocminfo.
+
+This patch is NOT meant to be committed into the aiter submodule.
+
+--- a/setup.py
++++ b/setup.py
+@@ -145,8 +145,9 @@ if not _is_metadata_only() and not IS_WINDOWS:
+     else:
+         IS_ROCM = False
+
+-    if not IS_ROCM:
+-        raise NotImplementedError("Only ROCM is supported")
++    if not IS_ROCM:
++        print("[experimental] Non-ROCm build: skipping CK/HIP extension build", flush=True)
++        ENABLE_CK = False
+
+     ck_dir = os.environ.get("CK_DIR", f"{this_dir}/3rdparty/composable_kernel")
+     if ENABLE_CK:
+--- a/aiter/jit/utils/cpp_extension.py
++++ b/aiter/jit/utils/cpp_extension.py
+@@ -89,7 +89,8 @@ def get_hip_version():
+         hipconfig = executable_path("hipconfig")
+         output = subprocess.check_output([hipconfig, "--version"], text=True)
+         return output
+     except Exception:
+-        raise RuntimeError("ROCm version file not found")
++        # On non-ROCm hosts return None so module load completes; downstream
++        # code branches on IS_HIP_EXTENSION which falls back to False.
++        return None
+--- a/aiter/__init__.py
++++ b/aiter/__init__.py
+@@ -65,12 +65,14 @@ if os.path.isdir(_flydsl_cache) and "FLYDSL_RUNTIME_CACHE_DIR" not in os.environ
+     os.environ["FLYDSL_RUNTIME_CACHE_DIR"] = _flydsl_cache
+
++# Always expose aiter.dtypes — it only needs torch + a GFX hint, both of which
++# work on non-ROCm if GPU_ARCHS is set. Keeping it outside the CK/HIP try block
++# means tests that only use dtypes.* can run on CUDA.
++try:
++    from .utility import dtypes as dtypes  # noqa: E402
++except Exception as _e:
++    logger.warning("aiter.dtypes unavailable: %s", _e)
++
+ if sys.platform == "win32":
+     logger.info("Windows: CK and HIP ops are not available. Triton ops only.")
+ elif AITER_AOT_IMPORT:
+     from .jit import core as core  # noqa: E402
+ else:
+     try:
+         from .jit import core as core  # noqa: E402
+-        from .utility import dtypes as dtypes  # noqa: E402
+         from .ops.enum import *  # noqa: F403,E402

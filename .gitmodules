@@ -1,0 +1,6 @@
+[submodule "aiter"]
+	path = aiter
+	url = https://github.com/ROCm/aiter
+[submodule "third_party/triton"]
+	path = third_party/triton
+	url = https://github.com/triton-lang/triton.git

@@ -1,0 +1,24 @@
+[project]
+name = "race-detector-experiments"
+version = "0.0.0"
+requires-python = ">=3.11,<3.13"
+# Only pure-Python deps that uv.lock can lock.
+# torch, triton, and aiter are handled by scripts/setup_cuda_gsan.sh
+# (CUDA wheel index, source build, PYTHONPATH respectively).
+dependencies = [
+  "pybind11>=3.0.1",
+  "ninja",
+  "pandas",
+  "einops",
+  "psutil",
+  "packaging",
+  "pytest",
+  "pytest-xdist",
+  "pytest-timeout",
+]
+
+# Anchor pytest's rootdir at this file so the repo-level conftest.py
+# (which sets up GSan) is always picked up, even when running tests inside aiter/.
+[tool.pytest.ini_options]
+testpaths = ["aiter/op_tests/triton_tests"]
+addopts = "--continue-on-collection-errors"

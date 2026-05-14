@@ -4,3 +4,7 @@
 [submodule "third_party/triton"]
 	path = third_party/triton
 	url = https://github.com/triton-lang/triton.git
+[submodule "third_party/triton-viz"]
+	path = third_party/triton-viz
+	url = https://github.com/Deep-Learning-Profiling-Tools/triton-viz.git
+	branch = race-detector-z3-demo

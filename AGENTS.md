@@ -71,6 +71,42 @@ These cost real time to discover. **Trust the prior diagnosis in `SURVEY.md`.**
    `aiter.ops.enum` calling `build_module()` at import. Don't try to
    completely fix this; route around it.
 
+## Preferred entry point: `run_aiter_gsan.py`
+
+There is now a Python orchestrator at the repo root that wraps the entire
+"run one kernel driver under GSan" flow. **Prefer it over hand-rolling the
+`source .venv/... && export PYTHONPATH=... && TRITON_*=... python
+run_with_gsan.py ...` chain.** What it handles:
+
+- Re-execs under `.venv/bin/python` if the caller used a different interpreter.
+- Sets `PYTHONPATH=aiter`, `TRITON_DISABLE_LINE_INFO=0`,
+  `TRITON_ALWAYS_COMPILE=1` (the latter two with `setdefault`, so user
+  overrides win).
+- Sets `triton.knobs.compilation.instrumentation_mode = "gsan"` directly
+  (env-var-only won't take effect once triton is imported).
+- Creates the GSan mem pool and runs the target script inside
+  `with torch.cuda.use_mem_pool(pool):` via `runpy.run_path`.
+- Wraps stderr with a sniffer that matches `(Read|Write) after (read|write)
+  race detected` lines and sets a machine-readable exit code.
+
+```bash
+python run_aiter_gsan.py                                   # defaults to extracted_kernels/demo_add.py
+python run_aiter_gsan.py extracted_kernels/my_driver.py
+python run_aiter_gsan.py extracted_kernels/my_driver.py -- --n 4096
+```
+
+Exit codes: `0` clean, `1` race lines detected, `2` target raised, `3`
+environment problem (no CUDA, missing script, ...). The lines themselves are
+still written to stderr — the exit code is in addition, not in place of them.
+
+**When to fall back to `run_with_gsan.py`:** debugging triton itself, custom
+env you'd rather set explicitly, or any flow where you don't want a sniffer
+between the target and your terminal.
+
+**Don't** use `run_aiter_gsan.py` as the harness for the `op_tests` pytest
+sweep — that path goes through `conftest.py`'s session-scope fixture, not
+through this orchestrator. The orchestrator is single-script only.
+
 ## Running a new experiment (the main path)
 
 The supported workflow is **extract one kernel + tiny driver**. This avoids
@@ -92,7 +128,10 @@ cp aiter/aiter/ops/triton/_triton_kernels/<name>.py extracted_kernels/
 #    NOT GiB) and launches the kernel. Use extracted_kernels/demo_add.py
 #    as the template.
 
-# 5. Run under GSan
+# 5. Run under GSan — preferred:
+python run_aiter_gsan.py extracted_kernels/<your_driver>.py
+
+#    or the lower-level wrapper if you need direct env control:
 TRITON_DISABLE_LINE_INFO=0 TRITON_ALWAYS_COMPILE=1 \
   python run_with_gsan.py extracted_kernels/<your_driver>.py
 ```
@@ -206,7 +245,8 @@ signature from `SURVEY.md` — *not* a GSan race report.
 
 | Path | Purpose |
 | --- | --- |
-| `run_with_gsan.py` | Wrapper. Sets `instrumentation_mode="gsan"`, creates pool, runs script inside `use_mem_pool`. Auto-injects `aiter/` and the script's directory into `sys.path`. |
+| `run_aiter_gsan.py` | **Preferred** single-script orchestrator. Re-execs under `.venv`, sets `PYTHONPATH=aiter` + `TRITON_DISABLE_LINE_INFO=0` + `TRITON_ALWAYS_COMPILE=1`, configures `instrumentation_mode="gsan"`, runs the driver inside `use_mem_pool`, sniffs stderr for race lines and returns a machine-readable exit code. |
+| `run_with_gsan.py` | Lower-level wrapper. Sets `instrumentation_mode="gsan"`, creates pool, runs script inside `use_mem_pool`. Auto-injects `aiter/` and the script's directory into `sys.path`. Use when you want direct control over env vars / no race sniffer. |
 | `conftest.py` | Pytest session-scope autouse fixture that does the same setup as the wrapper. Picked up because `pyproject.toml` anchors pytest's rootdir here. |
 | `scripts/setup_cuda_gsan.sh` | One-time installer for torch (cu128) and Triton from source. **Already run.** |
 | `extracted_kernels/demo_add.py` | Working template for writing your own driver. |

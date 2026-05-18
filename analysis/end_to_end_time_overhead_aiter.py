@@ -52,13 +52,29 @@ Whole-file exclusions:
 
 Per-test OOM adjustment (does NOT drop the file):
 
-  oom_subtraction — if gsan's log contains `torch.OutOfMemoryError`
-  lines for K tests in a file, subtract K tests from each backend's
-  counts (gsan failures absorb K first, then baseline / triton_viz
-  passes absorb the remainder). The file's target_seconds is still
-  used as-is in overhead ratios. Files where OOM dominates (the
-  effective test count after subtraction would be 0) are dropped
-  silently from the analysis set.
+  oom_subtraction — if gsan's log shows K OOM-failed tests in a file,
+  apply the same K subtraction to:
+
+    * Pass-rate counts: gsan absorbs K from `failed` first, then
+      `passed`; baseline and triton_viz absorb K from `failed` first
+      then `passed` too (so all three backends see N-K effective
+      tests for the file).
+
+    * Time ratios: gsan's `target_seconds` is left as-is (the K
+      OOM-fast-fails cost milliseconds and don't materially shift
+      its time). baseline / triton_viz `target_seconds` is
+      pro-rated by (N-K)/N — those backends actually ran the K
+      OOM-victim tests, so removing them means scaling the
+      file-level time by the surviving fraction (assuming roughly
+      uniform per-test cost within a backend).
+
+  Files where OOM dominates (K >= N → nothing left after
+  subtraction) are dropped from the analysis set.
+
+  This matches `end_to_end_time_itemized.py`'s per-file pro-rate
+  exactly, so a row's gsan/baseline ratio in this aggregator's
+  numbers equals the same row's `gsan/b` cell in the itemized
+  table.
 
 Usage:
     python analysis/end_to_end_time_overhead_aiter.py [--include-skipped] [--verbose]
@@ -193,15 +209,30 @@ def is_compile_error_tainted(log_path_str: str) -> bool:
 
 
 def overhead_stats(numerator: dict[str, dict], denominator: dict[str, dict],
-                   stems: list[str]) -> dict:
+                   stems: list[str],
+                   num_factor: dict[str, float] | None = None,
+                   den_factor: dict[str, float] | None = None) -> dict:
     """Compute target_seconds ratios across the given stems. Skip stems
-    where either side's target_seconds is missing or non-positive."""
+    where either side's target_seconds is missing or non-positive.
+
+    `num_factor` / `den_factor`: optional per-stem multipliers applied to
+    target_seconds before computing the ratio. Used for OOM-aware
+    pro-rating: when K of N tests OOM-fail in gsan, the backends that
+    actually ran those K tests (baseline / tviz) get scaled by
+    (N-K)/N so the comparison is restricted to the (N-K) tests gsan
+    was able to attempt. Mirrors `end_to_end_time_itemized.py`."""
+    num_factor = num_factor or {}
+    den_factor = den_factor or {}
     rows = []
     for s in stems:
         num = numerator.get(s, {}).get("target_seconds")
         den = denominator.get(s, {}).get("target_seconds")
         if num is None or den is None:
             continue
+        if num <= 0 or den <= 0:
+            continue
+        num *= num_factor.get(s, 1.0)
+        den *= den_factor.get(s, 1.0)
         if num <= 0 or den <= 0:
             continue
         rows.append((s, num / den, num, den))
@@ -356,10 +387,27 @@ def main(argv: list[str] | None = None) -> int:
         if oom_files:
             print(f"  [oom_partial_subtraction] {oom_files}")
 
+    # Build per-file pro-rate factors for time comparisons. gsan stays
+    # at 1.0 (OOM-fast-fails cost ~0; gsan_time already reflects the
+    # (N-K)-test time). baseline / tviz get scaled by (N-K)/N so they
+    # represent "the time those backends would spend on just the
+    # non-OOM tests" — same logic as end_to_end_time_itemized.py.
+    pro_rate: dict[str, float] = {}
+    for s in kept:
+        k = oom_per_file.get(s, 0)
+        n = b[s]["passed"] + b[s]["failed"] + b[s]["errors"]
+        pro_rate[s] = ((n - k) / n) if n > 0 else 0.0
+
     print()
-    print("=== Overhead = backend_time / baseline_time ===")
-    print_overhead("gsan       ", overhead_stats(g, b, kept))
-    print_overhead("triton_viz ", overhead_stats(t, b, kept))
+    print("=== Overhead = backend_time / baseline_time  (OOM-pro-rated) ===")
+    print_overhead("gsan       ",
+                   overhead_stats(g, b, kept,
+                                  num_factor=None,  # gsan unchanged
+                                  den_factor=pro_rate))
+    print_overhead("triton_viz ",
+                   overhead_stats(t, b, kept,
+                                  num_factor=pro_rate,
+                                  den_factor=pro_rate))
 
     # Build OOM-adjusted view of each backend's rows so pass-rate counts
     # are comparable across backends (the OOM-failed test data-points are

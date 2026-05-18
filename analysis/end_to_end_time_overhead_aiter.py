@@ -1,4 +1,4 @@
-"""Cross-backend comparison for a benchmark suite.
+"""Cross-backend comparison for the AITER benchmark suite.
 
 Reads three CSVs produced by `run.py`:
   - runs/<benchmark>_baseline_pytest.csv  (ground-truth, no instrumentation)
@@ -9,10 +9,13 @@ Reads three CSVs produced by `run.py`:
   - overhead = backend_time / baseline_time  (avg, median, min, max, sum/sum)
   - passed / failed / errors counts and pass rate (passed / (passed+failed+errors))
 
-The comparison excludes files where the per-file shell-timeout numbers
-don't reflect real instrumentation cost. Three filter classes (all
-applied, intersection of survivors used for every backend so the file set
-is consistent):
+The comparison filters out files whose per-file timing or counts don't
+honestly reflect instrumentation cost. Five whole-file exclusion classes
+(intersection survives for every backend so the file set is consistent),
+plus a per-test OOM adjustment that keeps OOM-partial files but subtracts
+the OOM-failed tests uniformly from every backend's counts.
+
+Whole-file exclusions:
 
   1. collection_error — baseline returned errors > 0 with no passed /
      failed (file failed at pytest collection, e.g. `from aiter import
@@ -20,44 +23,48 @@ is consistent):
 
   2. amd_only_skip — baseline returned skipped > 0 with no passed /
      failed / errors (every test in the file is gated by a
-     `@pytest.mark.skipif(...)` on an AMD-only architecture/dtype, and
-     the gate fired on this NVIDIA host).
+     `@pytest.mark.skipif(...)` on an AMD-only architecture/dtype).
 
-  3. oom — the file's gsan log contains `torch.OutOfMemoryError`. GSan
-     reserves a private CUDA pool that overflows on production shapes,
-     so the failures aren't kernel-level race signals; they distort the
-     overhead ratio downward (GSan exits fast on OOM). We exclude on the
-     gsan log only; baseline and triton-viz don't have a private pool.
+  3. compile_error — the file's baseline log shows a kernel-side
+     CUDA incompatibility that fails every test in roughly constant
+     time on every backend (so the ratio is meaningless). Signatures:
+       - `triton.compiler.errors.CompilationError` (fp8e4b8 / MXFP4)
+       - `KeyError: 'Keyword argument waves_per_eu'` (AMD-only kwarg)
+       - `AssertionError: Required config file doesn't exist` /
+         `isn't an existent file.` / `FileNotFoundError` — AITER's
+         per-arch autotune JSONs are CDNA4-only; the Blackwell-100
+         configs aren't shipped so `load_autotune_config(...)`
+         asserts before the kernel runs.
 
-  4. compile_error — the file's baseline log shows
-     `triton.compiler.errors.CompilationError` (e.g. fp8e4b8 not
-     supported on this device) or `KeyError: 'Keyword argument
-     waves_per_eu'` (AMD-only autotune kwarg). These are kernel-side
-     CUDA-incompatibilities, not instrumentation cost — they fail in
-     ~the same time on every backend, distorting the overhead ratio
-     toward 1x.
+  4. race_aborted — gsan reported `race_count > 0` for the file.
+     GSan's race detection fires a device-side CUDA assert that
+     permanently breaks the CUDA context; the rest of the file fails
+     in microseconds. The recorded gsan target_seconds is unfixable
+     because we can't disentangle "work before the assert" from
+     "fast-failing zombie tests after." The itemized table prints
+     `FAILED - RACE DETECTED` for these.
 
-  5. race_aborted — gsan reported `race_count > 0` for the file.
-     GSan's race detection fires a device-side CUDA assert, which
-     puts the CUDA context into a permanent error state for the rest
-     of the pytest session: all remaining tests fail in microseconds
-     without actually executing the kernel. This makes gsan's total
-     runtime artificially smaller than baseline (often <1x), which
-     looks like an instrumentation speedup but is really "gsan
-     stopped doing work earlier."
+  5. timeout — any of the three backends recorded `exit_code=124`
+     (shell SIGTERM at PER_FILE_TIMEOUT) for this file. No honest
+     `target_seconds` was written. The file is excluded from every
+     backend so the surviving file set is identical and `n` matches
+     across backends.
 
-  6. timeout — any of the three backends recorded `exit_code=124`
-     (shell SIGTERM at PER_FILE_TIMEOUT) for this file. The shell
-     killed the orchestrator's `finally` block before it could write
-     `target_seconds`, so there's no honest number to compare. The
-     file is excluded from every backend so the surviving file set
-     is identical and `n` matches across backends.
+Per-test OOM adjustment (does NOT drop the file):
+
+  oom_subtraction — if gsan's log contains `torch.OutOfMemoryError`
+  lines for K tests in a file, subtract K tests from each backend's
+  counts (gsan failures absorb K first, then baseline / triton_viz
+  passes absorb the remainder). The file's target_seconds is still
+  used as-is in overhead ratios. Files where OOM dominates (the
+  effective test count after subtraction would be 0) are dropped
+  silently from the analysis set.
 
 Usage:
-    python analysis/end_to_end_time_overhead.py [--benchmark NAME] \
-                                                [--include-skipped] [--verbose]
+    python analysis/end_to_end_time_overhead_aiter.py [--include-skipped] [--verbose]
 
-Defaults: benchmark=aiter. CSV/log paths follow the run.py convention.
+Defaults: benchmark=aiter (hardcoded; pass --benchmark to override).
+CSV/log paths follow the run.py convention.
 """
 from __future__ import annotations
 
@@ -119,16 +126,64 @@ def _log_has_any(log_path_str: str, needles: tuple) -> bool:
     return False
 
 
-def is_oom_tainted(log_path_str: str) -> bool:
-    """File's gsan log mentions torch.OutOfMemoryError → exclude."""
-    return _log_has_any(log_path_str, ("torch.OutOfMemoryError",))
+def count_oom_lines(log_path_str: str) -> int:
+    """Count `torch.OutOfMemoryError` occurrences in a log file."""
+    if not log_path_str:
+        return 0
+    p = Path(log_path_str)
+    if not p.is_file():
+        return 0
+    n = 0
+    try:
+        with open(p, errors="replace") as f:
+            for line in f:
+                if "torch.OutOfMemoryError" in line:
+                    n += 1
+    except OSError:
+        return 0
+    return n
+
+
+def oom_failed_test_count(g_row: dict) -> int:
+    """Estimate the number of distinct OOM-failed tests in gsan's log.
+
+    Heuristic: pytest emits roughly 2 `torch.OutOfMemoryError` lines per
+    failed test (the `E` traceback line + the `--tb=line` line). Cap at
+    `gsan_failed` since a non-OOM failure shouldn't be attributed to OOM."""
+    lines = count_oom_lines(g_row.get("log_path", ""))
+    estimate = max(0, lines // 2)
+    return min(estimate, g_row.get("failed", 0))
+
+
+def apply_oom_subtraction(row: dict, oom_count: int) -> dict:
+    """Return a shallow-copied row with `oom_count` tests subtracted from
+    failed first (capped at 0), then from passed. Mirrors how the OOM tests
+    would have shown up in each backend: gsan listed them as failed; the
+    other backends would have included them in their passes / fails."""
+    out = dict(row)
+    f_sub = min(oom_count, out.get("failed", 0))
+    out["failed"] = out.get("failed", 0) - f_sub
+    remaining = oom_count - f_sub
+    p_sub = min(remaining, out.get("passed", 0))
+    out["passed"] = out.get("passed", 0) - p_sub
+    return out
 
 
 # Kernel-side CUDA-incompatibility signatures. Same time on every backend
-# (fails in compile / setup), so they bias overhead toward 1x.
+# (fails in compile / setup / config-discovery), so they bias overhead
+# toward 1x and the ratios aren't measuring instrumentation cost.
+#   - CompilationError / waves_per_eu: AMD-only autotune-kwarg / dtype.
+#   - AssertionError on a config-file existence check, and the
+#     FileNotFoundError variant of the same: AITER ships per-arch
+#     autotune JSONs (`100-<KERNEL>.json` for Blackwell SM10), but only
+#     the CDNA4 ones are present in the repo, so the kernel's
+#     `load_autotune_config(...)` call asserts on missing file.
 _COMPILE_ERROR_NEEDLES = (
     "triton.compiler.errors.CompilationError",
     "KeyError: 'Keyword argument waves_per_eu",
+    "Required config file doesn't exist",
+    "isn't an existent file.",
+    "FileNotFoundError",
 )
 
 
@@ -239,67 +294,88 @@ def main(argv: list[str] | None = None) -> int:
     # ----- apply filters -----
     excluded_collection: list[str] = []
     excluded_amdskip: list[str] = []
-    excluded_oom: list[str] = []
     excluded_compile: list[str] = []
     excluded_race: list[str] = []
     excluded_timeout: list[str] = []
+    excluded_oom_dominated: list[str] = []
+    # Per-file OOM-test counts: subtracted from each backend's counts so
+    # the comparison stays apples-to-apples. Not used to drop the file
+    # unless the subtraction would leave zero effective tests.
+    oom_per_file: dict[str, int] = {}
     kept: list[str] = []
     for s in all_stems:
         if is_collection_error(b[s]):
             excluded_collection.append(s); continue
         if is_amd_only_skip(b[s]):
             excluded_amdskip.append(s); continue
-        # OOM detection: look at gsan's log (OOM is a gsan-pool-only artifact)
-        g_log = g.get(s, {}).get("log_path", "")
-        if is_oom_tainted(g_log):
-            excluded_oom.append(s); continue
         # Compile-time CUDA incompatibility: check baseline log (kernel-side,
         # not instrumentation; same in every backend).
         b_log = b.get(s, {}).get("log_path", "")
         if is_compile_error_tainted(b_log):
             excluded_compile.append(s); continue
         # Race-induced CUDA-context abort: GSan firing __assertfail kills
-        # the rest of the pytest session. The remaining tests fail in µs,
-        # making gsan's total target_seconds artificially small.
+        # the rest of the pytest session. Timing is unfixable.
         if g.get(s, {}).get("race_count", 0) > 0:
             excluded_race.append(s); continue
-        # Shell SIGTERM (exit_code=124) in ANY backend: the orchestrator's
-        # `finally` didn't write target_seconds. Drop the file from every
-        # backend so the surviving file set is the same across backends.
+        # Shell SIGTERM (exit_code=124) in ANY backend: orchestrator's
+        # `finally` didn't write target_seconds. Drop so file set matches.
         if any(d.get(s, {}).get("exit_code", 0) == 124 for d in (b, g, t)):
             excluded_timeout.append(s); continue
+        # OOM is now a per-test subtraction, not a whole-file exclusion.
+        # Estimate K = number of gsan-OOM-failed tests. If subtracting K
+        # would leave zero effective tests in baseline, the file is OOM-
+        # dominated and contributes nothing meaningful — drop it.
+        oom_count = oom_failed_test_count(g.get(s, {}))
+        b_total = b[s]["passed"] + b[s]["failed"] + b[s]["errors"]
+        if oom_count >= b_total:
+            excluded_oom_dominated.append(s); continue
+        oom_per_file[s] = oom_count
         kept.append(s)
 
-    print(f"  excluded (collection_error)       : {len(excluded_collection)}")
-    print(f"  excluded (amd_only_skip)          : {len(excluded_amdskip)}")
-    print(f"  excluded (gsan log shows OOM)     : {len(excluded_oom)}")
-    print(f"  excluded (baseline compile_error) : {len(excluded_compile)}")
-    print(f"  excluded (gsan race-induced abort): {len(excluded_race)}")
-    print(f"  excluded (any backend TIMEOUT)    : {len(excluded_timeout)}")
-    print(f"  --> analysis set                  : {len(kept)} files")
+    print(f"  excluded (collection_error)        : {len(excluded_collection)}")
+    print(f"  excluded (amd_only_skip)           : {len(excluded_amdskip)}")
+    print(f"  excluded (baseline compile_error)  : {len(excluded_compile)}")
+    print(f"  excluded (gsan race-induced abort) : {len(excluded_race)}")
+    print(f"  excluded (any backend TIMEOUT)     : {len(excluded_timeout)}")
+    print(f"  excluded (OOM-dominated, K >= total): {len(excluded_oom_dominated)}")
+    print(f"  --> analysis set                   : {len(kept)} files")
+    files_with_oom_subtraction = sum(1 for v in oom_per_file.values() if v > 0)
+    total_subtracted = sum(oom_per_file.values())
+    print(f"  …of which {files_with_oom_subtraction} files have partial OOM "
+          f"({total_subtracted} test data-points subtracted uniformly across backends)")
     if args.verbose:
         for label, lst in [("collection_error", excluded_collection),
                            ("amd_only_skip", excluded_amdskip),
-                           ("oom", excluded_oom),
                            ("compile_error", excluded_compile),
                            ("race_aborted", excluded_race),
-                           ("timeout", excluded_timeout)]:
+                           ("timeout", excluded_timeout),
+                           ("oom_dominated", excluded_oom_dominated)]:
             if lst:
                 print(f"  [{label}] {lst}")
+        oom_files = [(s, k) for s, k in oom_per_file.items() if k > 0]
+        if oom_files:
+            print(f"  [oom_partial_subtraction] {oom_files}")
 
     print()
     print("=== Overhead = backend_time / baseline_time ===")
     print_overhead("gsan       ", overhead_stats(g, b, kept))
     print_overhead("triton_viz ", overhead_stats(t, b, kept))
 
+    # Build OOM-adjusted view of each backend's rows so pass-rate counts
+    # are comparable across backends (the OOM-failed test data-points are
+    # subtracted from every backend's totals).
+    b_adj = {s: apply_oom_subtraction(b[s], oom_per_file.get(s, 0)) for s in kept}
+    g_adj = {s: apply_oom_subtraction(g.get(s, {}), oom_per_file.get(s, 0)) for s in kept}
+    t_adj = {s: apply_oom_subtraction(t.get(s, {}), oom_per_file.get(s, 0)) for s in kept}
+
     print()
     skipped_note = " (incl. skipped)" if args.include_skipped else " (excl. skipped)"
-    print(f"=== Pass rate{skipped_note} on the analysis set ===")
-    print_passrate("baseline   ", pass_rate_stats(b, kept, args.include_skipped),
+    print(f"=== Pass rate{skipped_note}, OOM-adjusted, on the analysis set ===")
+    print_passrate("baseline   ", pass_rate_stats(b_adj, kept, args.include_skipped),
                    args.include_skipped)
-    print_passrate("gsan       ", pass_rate_stats(g, kept, args.include_skipped),
+    print_passrate("gsan       ", pass_rate_stats(g_adj, kept, args.include_skipped),
                    args.include_skipped)
-    print_passrate("triton_viz ", pass_rate_stats(t, kept, args.include_skipped),
+    print_passrate("triton_viz ", pass_rate_stats(t_adj, kept, args.include_skipped),
                    args.include_skipped)
 
     return 0

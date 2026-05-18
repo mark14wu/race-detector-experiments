@@ -9,10 +9,20 @@ actually exercise the test machinery on CUDA — see
 - backend / baseline overhead ratio
 - per-backend passed / failed / errors
 
-Where a backend's row has `exit_code == 124` (shell SIGTERM at the
-PER_FILE_TIMEOUT cap) or `target_seconds` is missing, the value is
-printed as `TIMEOUT` instead of a number; ratios involving it are
-printed as `n/a`.
+Where a backend's row has:
+  - `exit_code == 124` (shell SIGTERM at the PER_FILE_TIMEOUT cap) or
+    `target_seconds` missing → cell prints `TIMEOUT`.
+  - `race_count > 0` → cell prints `FAILED - RACE DETECTED`. GSan's
+    race detector fires a CUDA device-side assert; the rest of the
+    pytest session runs in a permanently-broken CUDA context and the
+    remaining tests fail in microseconds. `target_seconds` looks like
+    a number but it's the prefix of real work + zombie time.
+  - log contains `torch.OutOfMemoryError` → cell prints `FAILED - OOM`.
+    GSan's private CUDA mem pool isn't big enough for production-shape
+    allocations; tests fail at allocation time rather than executing
+    the kernel, so `target_seconds` measures the fast-fail path.
+
+Ratios involving a non-numeric cell print as `n/a`.
 
 Use this when you need to see the raw per-file picture — `end_to_end_
 time_overhead.py` aggregates over a filtered analysis set and hides
@@ -54,22 +64,51 @@ def load_csv(path: Path) -> dict[str, dict]:
     return rows
 
 
+_TIME_CELL_W = 22  # wide enough for "FAILED - RACE DETECTED"
+
+
+def _log_has_oom(log_path_str: str) -> bool:
+    if not log_path_str:
+        return False
+    p = Path(log_path_str)
+    if not p.is_file():
+        return False
+    try:
+        with open(p, errors="replace") as f:
+            for line in f:
+                if "torch.OutOfMemoryError" in line:
+                    return True
+    except OSError:
+        return False
+    return False
+
+
+def _is_unreliable(row: dict) -> str | None:
+    """Return a short label for why this row's target_seconds is not
+    comparable, or None if it's a normal measurement."""
+    if row.get("exit_code") == 124 or row.get("target_seconds") is None:
+        return "TIMEOUT"
+    if row.get("race_count", 0) > 0:
+        return "FAILED - RACE DETECTED"
+    if _log_has_oom(row.get("log_path", "")):
+        return "FAILED - OOM"
+    return None
+
+
 def fmt_time(row: dict) -> str:
-    """A nicely-padded cell for the time column. TIMEOUT if SIGTERM'd."""
-    if row.get("exit_code") == 124:
-        return "  TIMEOUT"
-    t = row.get("target_seconds")
-    if t is None:
-        return "  TIMEOUT"          # also covers "no row" / parse errors
-    return f"{t:8.2f}s"
+    """A nicely-padded cell for the time column."""
+    label = _is_unreliable(row)
+    if label:
+        return f"{label:>{_TIME_CELL_W}}"
+    return f"{row['target_seconds']:>{_TIME_CELL_W - 1}.2f}s"
 
 
 def fmt_ratio(num_row: dict, den_row: dict) -> str:
-    if num_row.get("exit_code") == 124 or den_row.get("exit_code") == 124:
+    if _is_unreliable(num_row) or _is_unreliable(den_row):
         return "    n/a"
-    n = num_row.get("target_seconds")
-    d = den_row.get("target_seconds")
-    if n is None or d is None or d <= 0:
+    n = num_row["target_seconds"]
+    d = den_row["target_seconds"]
+    if d <= 0:
         return "    n/a"
     return f"{n/d:6.2f}x"
 
@@ -106,7 +145,7 @@ def main(argv: list[str] | None = None) -> int:
     print()
 
     head = (f"{'file':<40} "
-            f"{'baseline':>10} {'gsan':>10} {'tviz':>10}  "
+            f"{'baseline':>{_TIME_CELL_W}} {'gsan':>{_TIME_CELL_W}} {'tviz':>{_TIME_CELL_W}}  "
             f"{'gsan/b':>7} {'tviz/b':>7}  "
             f"baseline counts             gsan counts                 tviz counts")
     print(head)
@@ -117,7 +156,7 @@ def main(argv: list[str] | None = None) -> int:
         g_row = g.get(s, {})
         t_row = t.get(s, {})
         print(f"{s:<40} "
-              f"{fmt_time(b_row):>10} {fmt_time(g_row):>10} {fmt_time(t_row):>10}  "
+              f"{fmt_time(b_row)} {fmt_time(g_row)} {fmt_time(t_row)}  "
               f"{fmt_ratio(g_row, b_row):>7} {fmt_ratio(t_row, b_row):>7}  "
               f"{fmt_counts(b_row):<26}  {fmt_counts(g_row):<26}  {fmt_counts(t_row)}")
 

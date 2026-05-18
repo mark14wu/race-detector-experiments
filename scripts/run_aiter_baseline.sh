@@ -21,7 +21,7 @@ source .venv/bin/activate
 
 LIST=benchmarks/aiter/pytest_files.txt
 PROGRESS_LOG=/tmp/run_aiter_baseline.log
-PER_FILE_TIMEOUT=300   # seconds; baseline has no OOM, most files finish fast
+PER_FILE_TIMEOUT=3600  # seconds; matches gsan cap. test_causal_conv1d has 4920 collected tests — at ~3.6 tests/s baseline needs ~22 min on that file alone
 
 total=$(wc -l < "$LIST")
 i=0

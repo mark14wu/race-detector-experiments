@@ -32,7 +32,7 @@ source .venv/bin/activate
 
 LIST=benchmarks/aiter/pytest_files.txt
 PROGRESS_LOG=/tmp/run_aiter_triton_viz.log
-PER_FILE_TIMEOUT=600   # seconds; longer doesn't help — numpy isn't interruptible
+PER_FILE_TIMEOUT=1200  # seconds; numpy isn't interruptible past pytest --timeout, but longer cap lets pytest progress further before SIGTERM
 
 total=$(wc -l < "$LIST")
 i=0

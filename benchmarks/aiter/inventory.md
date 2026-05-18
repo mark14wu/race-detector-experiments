@@ -46,21 +46,23 @@ AITER 是 ROCm/AMD 项目。绝大多数 test 在源码层就有
 
 ## 8,944 个 FAILED 的原因（baseline）
 
-Baseline 没有 race detector，所以这些是 AITER kernel 在 CUDA 上的"真实
-失败"——不是 GSan 私 pool OOM 之类的 instrumentation 副作用：
+按文件归类的"primary failure"分布——28 个 baseline 文件 **每个 test 都失败**，
+归因如下（每文件取数量最多的 error 模式作为代表）：
 
-- **AMD-only autotune kwarg `waves_per_eu`** → NVIDIA Triton compile 路径
-  不认 → `KeyError`。
-- **数值断言失败**：测试拿 Triton kernel 结果跟 PyTorch reference 对比，
-  部分 shape/dtype 超出 tolerance。
-- **AMD-only 类型/op**（fp8e4b8 等 `triton.compiler.errors.CompilationError`）。
-- 一些 kernel 用了 ROCm-specific API（`from aiter import dtypes` 之外的
-  其他间接调用 ROCm 的路径）。
+| 主因 | 文件数 | 涉及测试数 | 说明 |
+|---|---:|---:|---|
+| 缺 Blackwell-specific autotune config（`100-<KERNEL>.json`） | **22** | ~7,500 | AITER 给每种 `<compute_capability>-<kernel>` 准备了 autotune JSON 配置文件，B200 的 `100-` 系列**只在 CDNA4 上 ship**；NVIDIA 上 import 时报 `AssertionError: Required config file doesn't exist` 或 `FileNotFoundError` |
+| AMD-only autotune kwarg `waves_per_eu` | **9** | ~2,500 | NVIDIA Triton compile 路径不认这个参数 → `KeyError: 'Keyword argument waves_per_eu'` |
 
-GSan 那边失败数会涨到 11,138（多 2,194），主要来源是 **GSan 私 pool OOM**
-对生产 shape 的 kernel（如 `vocab=128256` 的 test_topk、test_causal_conv1d）
-失败而不是 kernel 自身问题——`test_causal_conv1d` 一个文件就贡献了
-4920 - 2948 = 1,972 假失败。详见 `AGENTS.md` constraint #2。
+合计 28 / 8,579 — 跟 `8,944 baseline failed` 几乎完全对得上（剩 365 个 failed
+散在 11 个 has-some-passed 文件里，常见原因是数值 tolerance 超限）。
+
+**注意：baseline failed 里完全没有 GSan 私 pool OOM**（baseline 不创建私
+pool）。GSan 那边失败数会涨到 11,138（多 2,194），增量主要来源是 **GSan
+私 pool OOM** 对生产 shape kernel（如 `test_causal_conv1d` 一个文件就
+贡献 4920 - 2948 = 1,972 假失败）。详见 `AGENTS.md` constraint #2。
+
+详见 `benchmarks/aiter/passing_files.md` 看 11 个**有 test 通过**的文件清单。
 
 ## 19 个 ERROR 的原因
 

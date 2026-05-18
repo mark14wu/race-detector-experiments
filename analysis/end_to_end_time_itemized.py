@@ -5,7 +5,7 @@ baseline run produced at least one passing test (i.e. the kernels that
 actually exercise the test machinery on CUDA — see
 `benchmarks/aiter/passing_files.md`). For each file:
 
-- baseline / gsan / triton_viz `target_seconds`
+- baseline / gsan / triton_viz `target_seconds` (OOM-pro-rated)
 - backend / baseline overhead ratio
 - per-backend passed / failed / errors
 
@@ -20,27 +20,16 @@ Where a backend's row has:
 
 OOM handling (per-test time subtraction, NOT a marker):
 
-  Let K = number of OOM-failed tests in gsan's log (estimated as
-  `oom_lines // 2`, capped at `gsan_failed`). Let N = baseline's
-  P+F+E count for the file. Assume uniform per-test time within a
-  backend; then:
+  Let K = number of OOM-failed tests in gsan's log. Let N = baseline's
+  P+F+E count for the file. Then:
     - `baseline_adjusted = baseline_time * (N - K) / N`
-        (baseline ran all N tests including the K that would later
-        OOM in gsan — pro-rate to model "baseline restricted to the
-        N-K tests gsan was able to run")
-    - `gsan_adjusted     = gsan_time`
-        (gsan's K OOM-fails cost ~0; the time is already
-        approximately the (N-K)-test time)
+    - `gsan_adjusted     = gsan_time`        (OOM-fast-fails cost ~0)
     - `tviz_adjusted     = tviz_time * (N - K) / N`
-        (tviz didn't OOM, ran all N; same pro-rate as baseline)
-  When K == N (every gsan test OOM'd), every backend's adjusted time
-  collapses to 0 and ratios become `n/a`.
+  When K == N, every backend's adjusted time collapses to 0 and ratios
+  become `n/a`.
 
-Ratios involving a non-numeric or zero cell print as `n/a`.
-
-Use this when you need to see the raw per-file picture — `end_to_end_
-time_overhead.py` aggregates over a filtered analysis set and hides
-exactly the files that this script shows verbatim.
+All this lives in `analysis/common.py` and is shared with the
+aggregator `end_to_end_time_overhead_aiter.py`.
 
 Usage:
     python analysis/end_to_end_time_itemized.py [--benchmark NAME]
@@ -50,98 +39,33 @@ Defaults: benchmark=aiter. CSV paths follow the run.py convention.
 from __future__ import annotations
 
 import argparse
-import csv
 import sys
 from pathlib import Path
 
-REPO_ROOT = Path(__file__).resolve().parent.parent
-
-
-def load_csv(path: Path) -> dict[str, dict]:
-    rows: dict[str, dict] = {}
-    if not path.is_file():
-        print(f"[warn] missing CSV: {path}", file=sys.stderr)
-        return rows
-    with open(path) as f:
-        for r in csv.DictReader(f):
-            stem = Path(r["script"]).stem
-            for k in ("passed", "failed", "skipped", "errors",
-                      "race_count", "exit_code"):
-                r[k] = int(r.get(k) or 0)
-            try:
-                r["target_seconds"] = (
-                    float(r["target_seconds"]) if r.get("target_seconds") else None
-                )
-            except ValueError:
-                r["target_seconds"] = None
-            rows[stem] = r
-    return rows
-
+import common as cm
 
 _TIME_CELL_W = 22  # wide enough for "FAILED - RACE DETECTED"
 
 
-def _is_unreliable(row: dict) -> str | None:
-    """Return a short label for why this row's time is structurally
-    not comparable, or None if it's a normal measurement. OOM is NOT
-    handled here — it's compensated via per-test subtraction below."""
-    if row.get("exit_code") == 124 or row.get("target_seconds") is None:
-        return "TIMEOUT"
-    if row.get("race_count", 0) > 0:
-        return "FAILED - RACE DETECTED"
-    return None
-
-
-def _count_gsan_oom_lines(log_path_str: str) -> int:
-    if not log_path_str:
-        return 0
-    p = Path(log_path_str)
-    if not p.is_file():
-        return 0
-    n = 0
-    try:
-        with open(p, errors="replace") as f:
-            for line in f:
-                if "torch.OutOfMemoryError" in line:
-                    n += 1
-    except OSError:
-        return 0
-    return n
-
-
-def oom_test_count(g_row: dict) -> int:
-    """Estimate the number of distinct OOM-failed tests in gsan's log.
-    pytest prints ~2 OOM lines per failed test under --tb=line (the
-    `E` traceback line + the `--tb=line` summary line). Cap at the
-    gsan_failed count."""
-    lines = _count_gsan_oom_lines(g_row.get("log_path", ""))
-    estimated = max(0, lines // 2)
-    return min(estimated, g_row.get("failed", 0))
-
-
-def adjusted_time(row: dict, factor: float) -> float | None:
-    """Apply OOM-subtraction pro-rate factor to a row's target_seconds.
-    gsan stays at `factor=1.0` (its time already excludes OOM-fast-fails);
-    baseline / tviz get factored by `(N - K) / N`. Returns None if the
-    row is structurally unreliable (TIMEOUT / RACE)."""
-    if _is_unreliable(row) is not None:
-        return None
-    return row["target_seconds"] * factor
-
-
 def fmt_time_adjusted(row: dict, factor: float) -> str:
     """Print the OOM-adjusted target_seconds (or the unreliable label)."""
-    label = _is_unreliable(row)
+    label = cm.is_unreliable_time(row)
     if label:
         return f"{label:>{_TIME_CELL_W}}"
     t = row["target_seconds"] * factor
     return f"{t:>{_TIME_CELL_W - 1}.2f}s"
 
 
+def _adjusted_value(row: dict, factor: float) -> float | None:
+    if cm.is_unreliable_time(row) is not None:
+        return None
+    return row["target_seconds"] * factor
+
+
 def fmt_ratio_adjusted(num_row: dict, den_row: dict,
                        num_factor: float, den_factor: float) -> str:
-    n = adjusted_time(num_row, num_factor)
-    d = adjusted_time(den_row, den_factor)
+    n = _adjusted_value(num_row, num_factor)
+    d = _adjusted_value(den_row, den_factor)
     if n is None or d is None or d <= 0:
         return "    n/a"
     return f"{n/d:6.2f}x"
@@ -158,17 +82,14 @@ def main(argv: list[str] | None = None) -> int:
     p.add_argument("--benchmark", default="aiter")
     args = p.parse_args(argv)
 
-    csv_path = lambda backend: (REPO_ROOT / "runs"
-                                / f"{args.benchmark}_{backend}_pytest.csv")
-    b = load_csv(csv_path("baseline"))
-    g = load_csv(csv_path("gsan"))
-    t = load_csv(csv_path("triton_viz"))
+    b = cm.load_csv(cm.csv_path(args.benchmark, "baseline"))
+    g = cm.load_csv(cm.csv_path(args.benchmark, "gsan"))
+    t = cm.load_csv(cm.csv_path(args.benchmark, "triton_viz"))
     if not b:
-        print(f"[fatal] no baseline CSV at {csv_path('baseline')}", file=sys.stderr)
+        print(f"[fatal] no baseline CSV for benchmark={args.benchmark}",
+              file=sys.stderr)
         return 1
 
-    # Per the user's intent: enumerate the files where baseline ran at least
-    # one passing test (matches benchmarks/<benchmark>/passing_files.md).
     files = sorted(
         (stem for stem, row in b.items() if row.get("passed", 0) > 0),
         key=lambda s: -b[s]["passed"],  # most passes first
@@ -191,12 +112,8 @@ def main(argv: list[str] | None = None) -> int:
         b_row = b.get(s, {})
         g_row = g.get(s, {})
         t_row = t.get(s, {})
-        # OOM-adjustment factor: subtract K OOM-failed gsan tests from
-        # the test set, pro-rate baseline / tviz times accordingly.
-        k = oom_test_count(g_row)
-        n = (b_row.get("passed", 0) + b_row.get("failed", 0)
-             + b_row.get("errors", 0))
-        factor = (n - k) / n if n > 0 else 0.0
+        k = cm.oom_failed_test_count(g_row)
+        factor = cm.pro_rate_factor(b_row, k)
         print(f"{s:<40} {k:>4} "
               f"{fmt_time_adjusted(b_row, factor)} "
               f"{fmt_time_adjusted(g_row, 1.0)} "

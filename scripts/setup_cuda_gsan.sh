@@ -4,8 +4,8 @@
 #   - Triton main built from source (required for GSan)
 #
 # AITER is intentionally NOT installed — its setup.py raises on non-ROCm
-# (aiter/setup.py:148-149). We expose it via PYTHONPATH instead, and
-# run_with_gsan.py automatically inserts repo_root/aiter into sys.path.
+# (aiter/setup.py:148-149). We expose it via PYTHONPATH instead;
+# run_common.prepare_env inserts <repo>/aiter into sys.path at runtime.
 #
 # Usage:
 #   source .venv/bin/activate
@@ -38,9 +38,9 @@ uv pip install -r python/requirements.txt
 uv pip install -e . --no-build-isolation -v
 popd >/dev/null
 
-# 3. AITER stays out of pip. run_with_gsan.py adds repo_root/aiter to sys.path
-# at runtime, and `import aiter` succeeds because aiter/__init__.py:112-117
-# tolerates a missing CK/HIP runtime.
+# 3. AITER stays out of pip. run.py (via run_common.prepare_env) adds
+# <repo>/aiter to sys.path at runtime, and `import aiter` succeeds because
+# aiter/__init__.py tolerates a missing CK/HIP runtime.
 
 echo "[setup] done. Sanity check:"
 python - <<'PY'

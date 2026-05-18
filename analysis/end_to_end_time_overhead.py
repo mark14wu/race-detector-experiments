@@ -37,9 +37,25 @@ is consistent):
      ~the same time on every backend, distorting the overhead ratio
      toward 1x.
 
+  5. race_aborted — gsan reported `race_count > 0` for the file.
+     GSan's race detection fires a device-side CUDA assert, which
+     puts the CUDA context into a permanent error state for the rest
+     of the pytest session: all remaining tests fail in microseconds
+     without actually executing the kernel. This makes gsan's total
+     runtime artificially smaller than baseline (often <1x), which
+     looks like an instrumentation speedup but is really "gsan
+     stopped doing work earlier."
+
+  6. timeout — any of the three backends recorded `exit_code=124`
+     (shell SIGTERM at PER_FILE_TIMEOUT) for this file. The shell
+     killed the orchestrator's `finally` block before it could write
+     `target_seconds`, so there's no honest number to compare. The
+     file is excluded from every backend so the surviving file set
+     is identical and `n` matches across backends.
+
 Usage:
-    python analysis/end_to_end_runtime.py [--benchmark NAME] \
-                                          [--include-skipped] [--verbose]
+    python analysis/end_to_end_time_overhead.py [--benchmark NAME] \
+                                                [--include-skipped] [--verbose]
 
 Defaults: benchmark=aiter. CSV/log paths follow the run.py convention.
 """
@@ -225,6 +241,8 @@ def main(argv: list[str] | None = None) -> int:
     excluded_amdskip: list[str] = []
     excluded_oom: list[str] = []
     excluded_compile: list[str] = []
+    excluded_race: list[str] = []
+    excluded_timeout: list[str] = []
     kept: list[str] = []
     for s in all_stems:
         if is_collection_error(b[s]):
@@ -240,18 +258,32 @@ def main(argv: list[str] | None = None) -> int:
         b_log = b.get(s, {}).get("log_path", "")
         if is_compile_error_tainted(b_log):
             excluded_compile.append(s); continue
+        # Race-induced CUDA-context abort: GSan firing __assertfail kills
+        # the rest of the pytest session. The remaining tests fail in µs,
+        # making gsan's total target_seconds artificially small.
+        if g.get(s, {}).get("race_count", 0) > 0:
+            excluded_race.append(s); continue
+        # Shell SIGTERM (exit_code=124) in ANY backend: the orchestrator's
+        # `finally` didn't write target_seconds. Drop the file from every
+        # backend so the surviving file set is the same across backends.
+        if any(d.get(s, {}).get("exit_code", 0) == 124 for d in (b, g, t)):
+            excluded_timeout.append(s); continue
         kept.append(s)
 
     print(f"  excluded (collection_error)       : {len(excluded_collection)}")
     print(f"  excluded (amd_only_skip)          : {len(excluded_amdskip)}")
     print(f"  excluded (gsan log shows OOM)     : {len(excluded_oom)}")
     print(f"  excluded (baseline compile_error) : {len(excluded_compile)}")
+    print(f"  excluded (gsan race-induced abort): {len(excluded_race)}")
+    print(f"  excluded (any backend TIMEOUT)    : {len(excluded_timeout)}")
     print(f"  --> analysis set                  : {len(kept)} files")
     if args.verbose:
         for label, lst in [("collection_error", excluded_collection),
                            ("amd_only_skip", excluded_amdskip),
                            ("oom", excluded_oom),
-                           ("compile_error", excluded_compile)]:
+                           ("compile_error", excluded_compile),
+                           ("race_aborted", excluded_race),
+                           ("timeout", excluded_timeout)]:
             if lst:
                 print(f"  [{label}] {lst}")
 

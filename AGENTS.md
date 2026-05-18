@@ -14,12 +14,15 @@ results from the first sweep.
 ## Bootstrap (every shell session)
 
 ```bash
-cd /home/hwu27/workspace/race-detector-experiments
+cd /projects/kzhou6/hwu27/race-detector-experiments
 source .venv/bin/activate
-export PYTHONPATH="$PWD/aiter:$PYTHONPATH"   # AITER is NOT pip-installed
 ```
 
-That's it. `torch`, `triton` (built from source), and base deps are already
+`run.py` will set `PYTHONPATH=aiter[+third_party/triton-viz]` for its own
+subprocess; you only need PYTHONPATH manually if you're running pytest
+directly (without `run.py`).
+
+`torch`, `triton` (built from source), and base deps are already
 installed in `.venv/`. Do **not** run `scripts/setup_cuda_gsan.sh` — it has
 already run and rebuilds Triton from source (~6 min).
 
@@ -31,7 +34,8 @@ These have been run and confirmed; **don't redo them just to check**:
 | --- | --- | --- |
 | Triton's own GSan tests | `cd third_party/triton && TRITON_DISABLE_LINE_INFO=0 pytest -n 4 python/test/gsan` | 85 passed, 11 skipped (~23s) |
 | `import aiter` works on CUDA | `python -c "import aiter"` | warns, then OK (Triton ops available) |
-| End-to-end GSan wrapper | `python run_with_gsan.py extracted_kernels/demo_add.py` | passes, no race (expected) |
+| End-to-end orchestrator (baseline) | `python run.py --backend baseline aiter/op_tests/triton_tests/test_topk.py` | 40 passed, exit 0 (no instrumentation) |
+| End-to-end orchestrator (gsan) | `python run.py --backend gsan aiter/op_tests/triton_tests/test_topk.py` | 38 passed, 2 OOM-failed, exit 1 (private-pool OOM signature) |
 
 ## Known working environment
 
@@ -71,187 +75,140 @@ These cost real time to discover. **Trust the prior diagnosis in `SURVEY.md`.**
    `aiter.ops.enum` calling `build_module()` at import. Don't try to
    completely fix this; route around it.
 
-## Preferred entry point: `run_aiter_gsan.py`
+## Entry point: `run.py`
 
-There is now a Python orchestrator at the repo root that wraps the entire
-"run one kernel driver under GSan" flow. **Prefer it over hand-rolling the
-`source .venv/... && export PYTHONPATH=... && TRITON_*=... python
-run_with_gsan.py ...` chain.** What it handles:
+One Python orchestrator covers all (benchmark, backend) cells. Single CLI,
+no subcommands:
+
+```bash
+python run.py --backend {gsan,triton_viz,baseline} <test_file> [-- pytest_args]
+```
+
+`<test_file>` is a pytest test module (e.g. one of the 72 files in
+`benchmarks/aiter/pytest_files.txt`). The orchestrator spawns
+`python -m pytest <test_file>` as a subprocess; the repo-root
+`conftest.py` reads `BACKEND=<name>` env and installs the matching
+race-detector fixture inside the subprocess.
+
+What `run.py` (via `run_common.py`) handles:
 
 - Re-execs under `.venv/bin/python` if the caller used a different interpreter.
-- Sets `PYTHONPATH=aiter`, `TRITON_DISABLE_LINE_INFO=0`,
-  `TRITON_ALWAYS_COMPILE=1` (the latter two with `setdefault`, so user
-  overrides win).
-- Sets `triton.knobs.compilation.instrumentation_mode = "gsan"` directly
-  (env-var-only won't take effect once triton is imported).
-- Creates the GSan mem pool and runs the target script inside
-  `with torch.cuda.use_mem_pool(pool):` via `runpy.run_path`.
-- Wraps stderr with a sniffer that matches `(Read|Write) after (read|write)
-  race detected` lines and sets a machine-readable exit code.
+- Sets `PYTHONPATH=aiter[+third_party/triton-viz]` plus per-backend env
+  (`TRITON_DISABLE_LINE_INFO=0`, `TRITON_ALWAYS_COMPILE=1` for gsan;
+  `TRITON_INTERPRET=1` for triton-viz; nothing extra for baseline).
+- Tees subprocess stdout+stderr through a sniffer that matches
+  `(Read|Write) after (read|write) race detected` lines (start-of-line
+  anchored to avoid false matches on commentary).
+- Parses pytest's summary line for `passed/failed/skipped/errors`,
+  with a progress-char fallback when pytest gets SIGTERM'd mid-stream.
+- Writes a CSV row + raw log per run (see "Reporting outputs" below).
+
+### Backends
+
+| `--backend` | What it installs | When to use |
+|---|---|---|
+| `gsan` | Triton GSan via `triton.knobs.compilation.instrumentation_mode = "gsan"` + private CUDA mem pool (`with torch.cuda.use_mem_pool(...):` per session) | Default. Hardware-accurate but production shapes OOM in the private pool (see constraint #2). |
+| `triton_viz` | Monkey-patches `triton.jit`/`triton.autotune` to wrap kernels with `triton_viz.trace(client=RaceDetector(...))`. Forces `TRITON_INTERPRET=1`. | Z3-backed symbolic check. Slow; numerical results don't write back to CUDA tensors (assertion-failure side effect is expected). |
+| `baseline` | Nothing — plain Triton. `conftest.py` treats `BACKEND=baseline` as alias for `BACKEND=none`. | Control. Same test suite, race detector OFF. Useful for comparing what fails for race-detector reasons vs what fails anyway. |
+
+### triton-viz setup
 
 ```bash
-python run_aiter_gsan.py                                   # defaults to extracted_kernels/demo_add.py
-python run_aiter_gsan.py extracted_kernels/my_driver.py
-python run_aiter_gsan.py extracted_kernels/my_driver.py -- --n 4096
+cd third_party/triton-viz && uv sync --extra test
 ```
 
-Exit codes: `0` clean, `1` race lines detected, `2` target raised, `3`
-environment problem (no CUDA, missing script, ...). The lines themselves are
-still written to stderr — the exit code is in addition, not in place of them.
+**Don't** use `uv pip install -e third_party/triton-viz` from the parent
+venv — that misses transitive deps (`z3-solver`, `anytree`, ...); imports
+fail one at a time. `uv sync --extra test` pulls the full dep graph.
 
-**When to fall back to `run_with_gsan.py`:** debugging triton itself, custom
-env you'd rather set explicitly, or any flow where you don't want a sniffer
-between the target and your terminal.
+### Exit codes
 
-**Don't** use `run_aiter_gsan.py` as the harness for the `op_tests` pytest
-sweep — that path goes through `conftest.py`'s session-scope fixture, not
-through this orchestrator. The orchestrator is single-script only.
+- `0` pytest reported all tests passed (or no tests ran)
+- `1` at least one test failed OR sniffer caught a race line (check `race_count`)
+- `2` collection-time error inside pytest
+- `124` shell `timeout` SIGTERM'd the orchestrator (mark CSV row `notes=TIMEOUT 600`)
 
-## Running a new experiment (the main path)
+## Reporting outputs: `runs/<benchmark>_<backend>_pytest.csv` + `runs/logs/*.log`
 
-The supported workflow is **extract one kernel + tiny driver**. This avoids
-all four constraints above.
+Every `run.py` invocation writes:
 
-```bash
-# 1. Pick a kernel from one of these dirs
-ls aiter/aiter/ops/triton/                  # public kernel modules
-ls aiter/aiter/ops/triton/_triton_kernels/  # internal @triton.jit kernels
+- **CSV row** upserted into `runs/<benchmark>_<backend>_pytest.csv`
+  (one CSV per benchmark+backend combo, one row per `script`). Re-running
+  the same script overwrites its row; rows for other scripts in the same
+  CSV are preserved. Columns: `timestamp, benchmark, backend, script,
+  target_seconds, total_seconds, race_count, exit_code, passed, failed,
+  skipped, errors, log_path, notes`. Open in Excel / `pandas.read_csv`
+  directly.
+- **Raw log** at `runs/logs/<backend>_pytest_<script-stem>.log`. Full tee
+  of subprocess stdout+stderr, prefixed with a
+  `===== <ISO timestamp> ... =====` header line. **Each run truncates
+  its log file** — re-running the same script overwrites the previous
+  log. CSV is the place that accumulates history. Pass `--log <path>` if
+  you want a separate log to compare two runs side-by-side.
 
-# 2. Copy it (or a self-contained chunk of it) out
-cp aiter/aiter/ops/triton/_triton_kernels/<name>.py extracted_kernels/
+Overrides: `--csv PATH`, `--log PATH`, `--log-dir DIR`, `--no-csv`,
+`--no-log`, `--benchmark NAME`, `--notes TEXT`. `runs/` is in `.gitignore`.
 
-# 3. Strip aiter-internal imports (e.g. `make_kernel_repr`) — drop the @repr
-#    decorator, keep only `import triton`, `import triton.language as tl`,
-#    and torch.
+## Adding a new benchmark suite
 
-# 4. Add a `main()` that allocates SMALL torch.cuda tensors (KB–MiB range,
-#    NOT GiB) and launches the kernel. Use extracted_kernels/demo_add.py
-#    as the template.
+1. `mkdir -p benchmarks/<name>/`
+2. Write `benchmarks/<name>/pytest_files.txt` — one repo-relative
+   `test_*.py` path per line.
+3. Write `benchmarks/<name>/inventory.md` — total tests + categorized
+   skip/fail/error reasons. See `benchmarks/aiter/inventory.md` as a
+   template.
+4. `python run.py --benchmark <name> --backend gsan <one of the test files>`
+   — no new Python file required. CSV path will be
+   `runs/<name>_gsan_pytest.csv`.
 
-# 5. Run under GSan — preferred:
-python run_aiter_gsan.py extracted_kernels/<your_driver>.py
+## Sweeping all 72 test files for a benchmark
 
-#    or the lower-level wrapper if you need direct env control:
-TRITON_DISABLE_LINE_INFO=0 TRITON_ALWAYS_COMPILE=1 \
-  python run_with_gsan.py extracted_kernels/<your_driver>.py
-```
-
-What you're looking for in stderr:
-
-- `Read after write race detected`
-- `Write after read race detected`
-- `Write after write race detected`
-
-…each followed by source location (because `TRITON_DISABLE_LINE_INFO=0`).
-
-If the kernel allocates inside the wrapper's `with torch.cuda.use_mem_pool(pool):`
-(which it will, since allocations inside the `runpy.run_path` body are
-captured), GSan will see them.
-
-## Reproducing the partial sweep (~1460 tests, the SURVEY.md numbers)
-
-The full triton_tests sweep collects ~27666 tests. Under GSan it does **not**
-finish in reasonable time — the dominant failure mode is OOM in the GSan
-private pool (see constraint #2), and each failed test still has to compile
-under instrumentation. The numbers in `SURVEY.md` come from killing the run
-at ~5% progress (~1460 tests). To reproduce that exact recipe:
-
-### Step 1. Bootstrap (must be done in this shell)
+The canonical AITER test list is `benchmarks/aiter/pytest_files.txt`
+(72 lines; reproduces the 27,689-test total documented in
+`benchmarks/aiter/inventory.md`). Loop through it for any backend:
 
 ```bash
-cd /home/hwu27/workspace/race-detector-experiments
 source .venv/bin/activate
-export PYTHONPATH="$PWD/aiter:$PYTHONPATH"
+while read -r f; do
+  echo "=== $f ==="
+  timeout 600 python run.py --backend gsan "$f"
+done < benchmarks/aiter/pytest_files.txt
 ```
 
-`PYTHONPATH` is mandatory — AITER is not pip-installed.
+For triton-viz the per-file shell cap should be longer (interpreter mode
+can take 200–400s per file before hitting pytest's per-test cap). For
+baseline 600s is more than enough (most files finish in seconds).
 
-### Step 2. Launch the sweep in the background, logging to a file
+Per-file outcomes accumulate via CSV upsert at
+`runs/aiter_<backend>_pytest.csv`. A run that gets killed by shell
+`timeout` writes `exit_code=124` and the `finally` block may not finish
+writing the CSV row — fill those in manually as
+`notes=TIMEOUT 600`. Inventory expectations:
 
-```bash
-TRITON_DISABLE_LINE_INFO=0 \
-  python -m pytest -q --no-header --tb=no \
-    --timeout=300 --timeout-method=thread \
-    -p no:cacheprovider \
-    aiter/op_tests/triton_tests \
-    > /tmp/aiter_gsan_run.log 2>&1 &
-SWEEP_PID=$!
-echo "sweep pid=$SWEEP_PID, log=/tmp/aiter_gsan_run.log"
-```
+- GSan: 27,689 tests, 3,626 passed, 11,138 failed, 12,902 skipped,
+  179 race lines in 4 files (rmsnorm, layernorm, two moe_gemm files).
+- Baseline: similar skip counts but the GSan-private-pool OOM failures
+  pass instead → higher pass rate.
+- Triton-viz: many per-test timeouts under interpreter mode; treat
+  `exit_code=2`/numerical mismatches as expected (see Pitfalls).
 
-The `conftest.py` at the repo root supplies a session-scope autouse fixture
-that puts every test inside `with torch.cuda.use_mem_pool(create_mem_pool()):`,
-so GSan is automatically active for the whole sweep.
-
-### Step 3. Wait ~5 minutes and kill at ~5% progress
-
-```bash
-# Peek at progress every minute or so:
-tail -3 /tmp/aiter_gsan_run.log
-
-# When the progress marker (e.g. "[ 5%]") shows ~5%, kill the sweep:
-pkill -f "pytest.*triton_tests"
-# or: kill $SWEEP_PID
-```
-
-The sweep run from `SURVEY.md` was killed at the `[ 5%]` mark and yielded
-**1460 outcome characters** in the log. Killing earlier or later will give
-proportionally fewer/more.
-
-### Step 4. Count outcomes (this is what SURVEY.md tabulates)
-
-```bash
-# Each test contributes one of: . F s E in the progress line
-grep -oE '\.|F|s|E' /tmp/aiter_gsan_run.log | sort | uniq -c
-```
-
-Reference numbers from the original run:
-
-```
-     49 .     # passed   ~3.4%
-   1345 F     # failed   ~94.0%   (overwhelmingly OOM in private pool)
-     66 s     # skipped  ~4.6%
-                                  total = 1460
-```
-
-The ratio is the load-bearing finding — not the absolute count. Same trend
-should hold across kill points and minor Triton/AITER version drift.
-
-### Step 5. (Optional) Confirm a sample failure is OOM, not a real race
-
-```bash
-# Pick any failing test file and re-run with verbose tracebacks (small subset, fast)
-TRITON_DISABLE_LINE_INFO=0 \
-  python -m pytest --no-header --tb=line -q --timeout=60 \
-    aiter/op_tests/triton_tests/test_topk.py 2>&1 | tail -20
-```
-
-Expected: failures show `torch.OutOfMemoryError: CUDA out of memory ... in
-private pools` even though the GPU is mostly free. This is the diagnostic
-signature from `SURVEY.md` — *not* a GSan race report.
-
-### What NOT to do here
-
-- **Don't run without `&` in the foreground.** It will hang the shell
-  for hours; the foreground `pkill` won't fire.
-- **Don't omit `-p no:cacheprovider`** in a shared workspace — pytest cache
-  files inside the aiter submodule will pollute its working tree.
-- **Don't expect 27666 / X% / Y%-style numbers.** The progress percent stops
-  being meaningful once you kill mid-run; report against the 1460 total.
-- **Don't claim "AITER has races detected"** based on this sweep. The 94%
-  failure is allocator-OOM, not race detection.
+The 94% OOM-failure signature from `SURVEY.md` only applies to the GSan
+backend; baseline doesn't have a private pool. Use baseline runs to
+isolate "real fail from race-detector overhead" vs "fail anyway".
 
 ## Key files
 
 | Path | Purpose |
 | --- | --- |
-| `run_aiter_gsan.py` | **Preferred** single-script orchestrator. Re-execs under `.venv`, sets `PYTHONPATH=aiter` + `TRITON_DISABLE_LINE_INFO=0` + `TRITON_ALWAYS_COMPILE=1`, configures `instrumentation_mode="gsan"`, runs the driver inside `use_mem_pool`, sniffs stderr for race lines and returns a machine-readable exit code. |
-| `run_with_gsan.py` | Lower-level wrapper. Sets `instrumentation_mode="gsan"`, creates pool, runs script inside `use_mem_pool`. Auto-injects `aiter/` and the script's directory into `sys.path`. Use when you want direct control over env vars / no race sniffer. |
-| `conftest.py` | Pytest session-scope autouse fixture that does the same setup as the wrapper. Picked up because `pyproject.toml` anchors pytest's rootdir here. |
+| `run.py` | **The orchestrator.** Single CLI: `--backend {gsan,triton_viz,baseline} <test_file>`. Sets env, spawns pytest subprocess, tees stdout/stderr through a race-line sniffer, writes CSV row + log via `run_common`. |
+| `run_common.py` | Shared scaffolding. Holds `BACKEND_SPECS` registry, `get_backend`, `make_pytest_runner`, env prep, race-sniffing tee, CSV upsert, the `run_with_reporting` orchestrator. Future benchmarks reuse this — no new Python file needed. |
+| `conftest.py` | Pytest session-scope autouse fixture. Reads `BACKEND` env (passed in by `run.py`) and installs the right race-detector inside the pytest subprocess. `baseline` is aliased to `none` (no-op). |
+| `benchmarks/aiter/pytest_files.txt` | Canonical 72-line list of pytest test files for the AITER suite. Used by the sweep loop in "Sweeping all 72 test files" above. |
+| `benchmarks/aiter/inventory.md` | Human-readable AITER inventory: 27,689 tests total, broken down by passed/failed/skipped/errors plus categorized skip-reason table. Regenerate manually after a full sweep. |
+| `third_party/triton-viz/` | triton-viz submodule pinned on `race-detector-z3-demo`. Install via `cd third_party/triton-viz && uv sync --extra test`. |
 | `scripts/setup_cuda_gsan.sh` | One-time installer for torch (cu128) and Triton from source. **Already run.** |
-| `extracted_kernels/demo_add.py` | Working template for writing your own driver. |
-| `patches/aiter-cuda-experimental.patch` | Local-only fallback to make AITER pip-installable on CUDA by skipping the ROCm raise. **Don't apply unless you've ruled out the extracted-kernel path.** Has known limits — chain bottoms out at `aiter.ops.enum`. |
-| `aiter/aiter/ops/triton/` | Where to find kernels worth extracting. |
+| `patches/aiter-cuda-experimental.patch` | Local-only fallback to make AITER pip-installable on CUDA by skipping the ROCm raise. **Don't apply unless you have a specific need.** Has known limits — chain bottoms out at `aiter.ops.enum`. |
+| `aiter/aiter/ops/triton/` | Reference for the actual `@triton.jit` kernels under test. |
 | `third_party/triton/python/triton/experimental/gsan/` | GSan implementation reference. `src/GSanAllocator.cc` and `src/GSan.h` if you need to reason about pool/shadow sizing. |
 
 ## Pitfalls / anti-patterns
@@ -264,19 +221,25 @@ signature from `SURVEY.md` — *not* a GSan race report.
 - **Don't** trust agent-summarized claims about AITER's setup.py logic
   without reading the lines yourself. The first explorer agent on this repo
   read the `BUILD_TARGET` branches backwards.
-- **Don't** set `TRITON_INSTRUMENTATION_MODE=gsan` *after* `import triton`
-  in your script and expect it to take effect — Triton caches knobs at
-  import. The wrapper avoids this by setting the Python-level knob
-  (`triton.knobs.compilation.instrumentation_mode = "gsan"`) directly.
-- **Don't** allocate tensors *outside* the `with torch.cuda.use_mem_pool(pool):`
-  block — GSan can't see them. The wrapper and conftest both put your code
-  inside the block, so just don't manually bypass it.
+- **Don't** install triton-viz via `uv pip install -e third_party/triton-viz`
+  from the parent venv — that misses transitive deps (`z3-solver`, `anytree`,
+  ...). Use `cd third_party/triton-viz && uv sync --extra test`.
+- **Don't** treat the numerical mismatch under `--backend triton_viz` as a
+  regression. `TRITON_INTERPRET=1` + RaceDetector doesn't write results
+  back to CUDA tensors; assertion-failure side effects are expected. Compare
+  `race_count` and timing only.
 - **Don't** scale up shapes hoping more allocations will surface races.
-  Shapes that work in normal AITER tests will OOM under GSan. Start small.
+  Production-shape tests OOM under GSan's private pool. Use `--backend
+  baseline` to see what happens without the private-pool overhead.
 
 ## When in doubt
 
-1. Read `SURVEY.md` for what was tried and what failed and why.
-2. Read `README.md`'s "Known working environment" for last-known-good versions.
-3. Check `git log` (currently a single root commit) for project history.
-4. Look at `extracted_kernels/demo_add.py` as the canonical small example.
+1. Read `benchmarks/aiter/inventory.md` for the canonical breakdown of
+   what passes / fails / skips and why.
+2. Read `SURVEY.md` for what was tried before and how the constraints
+   were discovered.
+3. Read `README.md`'s "Known working environment" for last-known-good versions.
+4. Check `git log` for project history.
+5. Run one test file end-to-end:
+   `python run.py --backend baseline aiter/op_tests/triton_tests/test_topk.py`
+   then compare with `--backend gsan` and `--backend triton_viz`.

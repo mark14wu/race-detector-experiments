@@ -1,10 +1,16 @@
 # race-detector-experiments
 
-Run AITER's Triton kernels under Triton GSan (global memory race detector) on
-NVIDIA/CUDA. AITER's CK/HIP paths are out of scope — we only need its Triton
-kernels importable. For real bug-hunting, extract a kernel into
-`extracted_kernels/` and write a tiny driver; AITER op_tests are noisy under
-GSan (see `AGENTS.md`).
+Run AITER's Triton kernels under multiple race-detector backends on NVIDIA/CUDA.
+AITER's CK/HIP paths are out of scope — we only need its Triton kernels
+importable so we can probe them.
+
+Three race-detector backends are supported (`--backend ...`):
+
+- `gsan` — Triton's GSan (global memory race detector). Hardware-accurate but
+  needs a private CUDA mem pool that overflows on production shapes.
+- `triton_viz` — triton-viz's Z3-backed `RaceDetector` running under
+  `TRITON_INTERPRET=1`. Slow but no OOM.
+- `baseline` — plain Triton, no instrumentation. Control runs.
 
 ## Layout
 
@@ -12,10 +18,10 @@ GSan (see `AGENTS.md`).
 aiter/                          ROCm/aiter submodule (NOT pip-installed)
 third_party/triton/             triton-lang/triton, built from source
 third_party/triton-viz/         triton-viz on race-detector-z3-demo
-run_aiter_gsan.py               main entry point (env + GSan + race sniffer)
-run_with_gsan.py                low-level GSan wrapper (no sniffer)
-conftest.py                     enables GSan for pytest sweeps
-extracted_kernels/              minimal Triton drivers
+run.py                          unified entry: --backend × pytest test_file
+run_common.py                   shared scaffolding (BackendConfig registry, etc.)
+conftest.py                     installs the chosen backend per session
+benchmarks/<name>/              per-benchmark test list + inventory.md
 scripts/setup_cuda_gsan.sh      one-time: torch cu128 + Triton source build
 ```
 
@@ -35,26 +41,33 @@ Sanity-check the GSan path itself:
 TRITON_DISABLE_LINE_INFO=0 python -m pytest -n 8 third_party/triton/python/test/gsan
 ```
 
-## Running a kernel under GSan
+For triton-viz: `cd third_party/triton-viz && uv sync --extra test` to pull
+its z3-solver + anytree + ... dependencies (`uv pip install -e` is incomplete).
+
+## Running
 
 ```bash
-python run_aiter_gsan.py                                    # defaults to demo_add.py
-python run_aiter_gsan.py extracted_kernels/<driver>.py
-python run_aiter_gsan.py extracted_kernels/<driver>.py -- --n 4096
+# One test file under one backend:
+python run.py --backend gsan        aiter/op_tests/triton_tests/test_topk.py
+python run.py --backend triton_viz  aiter/op_tests/triton_tests/test_topk.py
+python run.py --backend baseline    aiter/op_tests/triton_tests/test_topk.py
+
+# Forward extra pytest args:
+python run.py --backend gsan aiter/op_tests/triton_tests/test_topk.py -- -k small
 ```
 
-The orchestrator re-execs under `.venv`, sets `PYTHONPATH=aiter` +
-`TRITON_DISABLE_LINE_INFO=0` + `TRITON_ALWAYS_COMPILE=1`, configures
-`instrumentation_mode="gsan"`, runs the driver inside `use_mem_pool`, and
-sniffs stderr for race lines. Exit codes: `0` clean, `1` race detected,
-`2` target raised, `3` env problem.
+Output per run:
+- **CSV row** at `runs/<benchmark>_<backend>_pytest.csv` (upsert by `script`).
+- **Raw log** at `runs/logs/<backend>_pytest_<stem>.log` (truncated per run).
 
-Race lines look like `Read after write race detected` /
-`Write after read race detected` / `Write after write race detected`,
-each followed by a source location.
+CSV columns include `passed/failed/skipped/errors` (parsed from pytest's
+summary line, with a progress-char fallback for runs where pytest got
+SIGTERM'd mid-stream). `race_count` is independent of pytest's exit code:
+the orchestrator sniffs stdout+stderr for race lines.
 
-For pytest sweeps or direct env control, drop down to `run_with_gsan.py`.
-The full extract-a-kernel recipe and op_tests caveats live in `AGENTS.md`.
+The full AITER inventory (27,689 tests, why they pass/fail/skip) is in
+`benchmarks/aiter/inventory.md`. The canonical 72-file list is
+`benchmarks/aiter/pytest_files.txt`.
 
 ## Known working environment
 

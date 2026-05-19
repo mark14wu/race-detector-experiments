@@ -1,6 +1,6 @@
 # AITER benchmark inventory
 
-Snapshot of the `aiter/op_tests/triton_tests/` pytest suite as seen on the
+Snapshot of the `benchmarks/aiter/aiter/op_tests/triton_tests/` pytest suite as seen on the
 NVIDIA/B200 host this repo runs on. **Canonical numbers come from the
 `baseline` backend** (`runs/aiter_baseline_pytest.csv`) — that's pytest's
 view of the suite without any race-detector instrumentation, which is what
@@ -84,10 +84,10 @@ pool）。GSan 那边失败数会涨到 11,138（多 2,194），增量主要来�
 
 | 文件 | race 行数 | extra teardown error |
 |------|---------:|:-:|
-| `aiter/op_tests/triton_tests/test_rmsnorm.py` | 103 | ✓ |
-| `aiter/op_tests/triton_tests/test_moe_gemm_a8w8_blockscale.py` | 32 | ✓ |
-| `aiter/op_tests/triton_tests/test_moe_gemm_int8_smoothquant.py` | 32 | ✓ |
-| `aiter/op_tests/triton_tests/test_layernorm.py` | 12 | ✓ |
+| `benchmarks/aiter/aiter/op_tests/triton_tests/test_rmsnorm.py` | 103 | ✓ |
+| `benchmarks/aiter/aiter/op_tests/triton_tests/test_moe_gemm_a8w8_blockscale.py` | 32 | ✓ |
+| `benchmarks/aiter/aiter/op_tests/triton_tests/test_moe_gemm_int8_smoothquant.py` | 32 | ✓ |
+| `benchmarks/aiter/aiter/op_tests/triton_tests/test_layernorm.py` | 12 | ✓ |
 | **合计** | **179** | **4** |
 
 GSan 的 P+F+S+E 总数 27,689 比 baseline 多 4，**正好对应**这 4 个 race-positive

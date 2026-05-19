@@ -27,11 +27,16 @@ caught a race report regardless of pytest's own exit code.
 from __future__ import annotations
 
 import argparse
+import os
 import sys
 from pathlib import Path
 
 REPO_ROOT = Path(__file__).resolve().parent
 BACKEND_CHOICES = ["gsan", "triton_viz", "baseline"]
+BENCHMARK_PATHS = {
+    "aiter":       REPO_ROOT / "benchmarks" / "aiter" / "aiter",
+    "tritonbench": REPO_ROOT / "benchmarks" / "tritonbench" / "tritonbench",
+}
 
 import run_common  # noqa: E402
 run_common.ensure_venv(REPO_ROOT, __file__)
@@ -40,10 +45,16 @@ from run_common import (  # noqa: E402
     add_common_args,
     get_backend,
     make_pytest_runner,
+    make_script_runner,
     prepare_env,
     resolve_paths,
     run_with_reporting,
 )
+
+BENCHMARK_RUNNERS = {
+    "aiter":       make_pytest_runner,   # pytest test_*.py files
+    "tritonbench": make_script_runner,   # `python <file>.py`
+}
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -62,7 +73,7 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument(
         "script",
         help="Path to a pytest test_*.py file (e.g. "
-             "aiter/op_tests/triton_tests/test_topk.py).",
+             "benchmarks/aiter/aiter/op_tests/triton_tests/test_topk.py).",
     )
     p.add_argument(
         "script_args",
@@ -86,12 +97,15 @@ def main(argv: list[str] | None = None) -> int:
         forwarded = forwarded[1:]
 
     backend = get_backend(args.backend)
-    prepare_env(REPO_ROOT, backend)
+    benchmark_path = BENCHMARK_PATHS[args.benchmark]
+    prepare_env(backend, benchmark_path)
+    os.environ["BENCHMARK"] = args.benchmark
 
     csv_path, log_path = resolve_paths(args, REPO_ROOT, backend.name, target)
 
     extra_csv: dict = {}
-    runner = make_pytest_runner(backend, target, extra_csv)
+    runner_factory = BENCHMARK_RUNNERS[args.benchmark]
+    runner = runner_factory(backend, target, extra_csv)
 
     return run_with_reporting(
         backend=backend,

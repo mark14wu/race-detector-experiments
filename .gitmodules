@@ -1,5 +1,5 @@
 [submodule "aiter"]
-	path = aiter
+	path = benchmarks/aiter/aiter
 	url = https://github.com/ROCm/aiter
 [submodule "third_party/triton"]
 	path = third_party/triton
@@ -8,3 +8,6 @@
 	path = third_party/triton-viz
 	url = https://github.com/Deep-Learning-Profiling-Tools/triton-viz.git
 	branch = race-detector-z3-demo
+[submodule "benchmarks/tritonbench/tritonbench"]
+	path = benchmarks/tritonbench/tritonbench
+	url = https://github.com/thunlp/TritonBench.git

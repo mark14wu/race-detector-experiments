@@ -5,7 +5,7 @@ What lives here:
   * `T0`             — wall-time anchor that survives `os.execv` (re-exec into
                        `.venv`) so `total_seconds` is meaningful end-to-end.
   * `ensure_venv`    — re-exec under the repo's `.venv/bin/python` when needed.
-  * `prepare_env`    — `PYTHONPATH=aiter[+...]`, default env vars, `sys.path`
+  * `prepare_env`    — `PYTHONPATH=<benchmark>[+...]`, default env vars, `sys.path`
                        insertions; takes a backend-specific knob bag.
   * `BackendConfig`  — describes a backend's name, env-var defaults, extra
                        paths, race-output regex, and per-test pytest timeout.
@@ -45,6 +45,7 @@ import subprocess
 import sys
 import time
 import traceback
+from contextlib import contextmanager
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Callable, Iterable, Optional
@@ -173,11 +174,10 @@ def ensure_venv(repo_root: Path, caller_script: str) -> None:
 # ---------------------------------------------------------------------------
 # Environment prep
 # ---------------------------------------------------------------------------
-def prepare_env(repo_root: Path, backend: BackendConfig) -> None:
-    aiter_path = repo_root / "aiter"
+def prepare_env(backend: BackendConfig, benchmark_path: Path) -> None:
     extra_paths = [Path(p) for p in backend.extra_paths]
 
-    parts: list[str] = [str(aiter_path), *(str(p) for p in extra_paths)]
+    parts: list[str] = [str(benchmark_path), *(str(p) for p in extra_paths)]
     existing = os.environ.get("PYTHONPATH", "")
     if existing:
         parts.append(existing)
@@ -186,9 +186,79 @@ def prepare_env(repo_root: Path, backend: BackendConfig) -> None:
     for k, v in backend.extra_env.items():
         os.environ.setdefault(k, v)
 
-    for p in [aiter_path, *extra_paths]:
+    for p in [benchmark_path, *extra_paths]:
         if p.is_dir() and str(p) not in sys.path:
             sys.path.insert(0, str(p))
+
+
+# ---------------------------------------------------------------------------
+# Backend installation (shared by pytest conftest and script_runner)
+# ---------------------------------------------------------------------------
+@contextmanager
+def install_backend(name: str):
+    """Install the named race-detector backend for the `with` block. Same
+    install steps the legacy pytest fixture in conftest.py used to do inline;
+    both conftest.py and scripts/script_runner.py now go through this.
+
+    `baseline` is aliased to `none` (no instrumentation)."""
+    name = name.strip().lower()
+    if name == "baseline":
+        name = "none"
+
+    if name == "gsan":
+        import torch
+        import triton
+        from triton.experimental.gsan import create_mem_pool
+
+        triton.knobs.compilation.instrumentation_mode = "gsan"
+        print(
+            f"[gsan] instrumentation_mode="
+            f"{triton.knobs.compilation.instrumentation_mode}",
+            file=sys.stderr,
+        )
+        pool = create_mem_pool()
+        with torch.cuda.use_mem_pool(pool):
+            yield
+        torch.cuda.synchronize()
+
+    elif name == "triton_viz":
+        import triton
+        import triton_viz
+        from triton_viz.clients import RaceDetector
+        from triton_viz.core.config import config as tv_cfg
+        from triton_viz.wrapper import create_patched_jit, create_patched_autotune
+
+        tv_cfg.cli_active = True
+
+        def _wrap(kernel):
+            tracer = triton_viz.trace(client=RaceDetector(abort_on_error=False))
+            return tracer(kernel)
+
+        patched_jit = create_patched_jit(_wrap)
+        patched_autotune = create_patched_autotune(_wrap)
+        triton.jit = patched_jit
+        triton.language.jit = patched_jit
+        import triton.runtime.interpreter as _interp
+        _interp.jit = patched_jit
+        triton.autotune = patched_autotune
+        os.environ.setdefault("TRITON_INTERPRET", "1")
+
+        print(
+            f"[triton_viz] RaceDetector installed; "
+            f"TRITON_INTERPRET={os.environ.get('TRITON_INTERPRET')}",
+            file=sys.stderr,
+        )
+        yield
+
+    elif name == "none":
+        print("[baseline] no race detector installed", file=sys.stderr)
+        yield
+
+    else:
+        raise ValueError(
+            f"unknown backend {name!r}; "
+            f"expected one of gsan, triton_viz, baseline/none"
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -312,7 +382,7 @@ _COUNT_RES = {
 }
 # Progress-char lines in pytest -q output: optional leading whitespace, then
 # a run of .FsExX, then ONE of: whitespace+[NN%], more whitespace, "+++"
-# (timeout marker), or end-of-line. Excludes "FAILED aiter/...::..." lines
+# (timeout marker), or end-of-line. Excludes "FAILED benchmarks/...::..." lines
 # because those don't fit the suffix.
 _PROGRESS_LINE_RE = re.compile(
     r"^(?P<chars>[.FsExX]+)(?:\s|\[|\+|$)"
@@ -433,6 +503,47 @@ def make_pytest_runner(
 
         # Propagate pytest's exit code via SystemExit so the SystemExit
         # handler in run_with_reporting picks it up as our exit_code.
+        raise SystemExit(proc.returncode)
+
+    return _runner
+
+
+# ---------------------------------------------------------------------------
+# Script runner factory (TritonBench-style benchmarks — plain `python <file>`)
+# ---------------------------------------------------------------------------
+def make_script_runner(
+    backend: BackendConfig,
+    test_file: Path,
+    extra_csv: dict,
+) -> Callable[[], None]:
+    """Runner for benchmarks that run as plain `python <file>.py` (no pytest).
+    Spawns `python scripts/script_runner.py <file>`; that wrapper reads the
+    BACKEND env, calls `install_backend(...)`, then `runpy.run_path`s the
+    target.
+
+    `extra_csv` is NOT populated with passed/failed/skipped/errors — those are
+    pytest concepts. Treat `exit_code == 0` as the pass signal."""
+
+    def _runner() -> None:
+        wrapper = REPO_ROOT / "scripts" / "script_runner.py"
+        cmd = [sys.executable, str(wrapper), str(test_file)]
+        print(f"{backend.tag} cmd: {' '.join(cmd)}", file=sys.stderr)
+
+        proc = subprocess.Popen(
+            cmd,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=True,
+            bufsize=1,
+            cwd=str(REPO_ROOT),
+            env=os.environ.copy(),
+        )
+
+        assert proc.stdout is not None
+        for line in proc.stdout:
+            sys.stdout.write(line)
+        proc.wait()
+
         raise SystemExit(proc.returncode)
 
     return _runner

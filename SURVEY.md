@@ -17,7 +17,7 @@ parameterize over.
 
 ### 1. Collection errors — ~19 / ~70 test files fail to import
 
-19 of the test files in `aiter/op_tests/triton_tests/` cannot even be
+19 of the test files in `benchmarks/aiter/aiter/op_tests/triton_tests/` cannot even be
 collected by pytest on a non-ROCm machine. Examples (see
 `/tmp/aiter_gsan_run.log` for the full list):
 
@@ -30,7 +30,7 @@ rope/test_rope.py         ImportError: cannot import name 'dtypes' from 'aiter'
 ...
 ```
 
-Root cause: `aiter/__init__.py:72-117` puts `from .utility import dtypes`
+Root cause: `benchmarks/aiter/aiter/aiter/__init__.py:72-117` puts `from .utility import dtypes`
 inside the same try-block as `from .jit import core`. The `core` import
 fails on CUDA (it triggers HIP JIT init), so the whole try block aborts
 before `dtypes` gets exposed. Patching this requires reaching deeper
@@ -103,7 +103,7 @@ shape was already clear.
 GSan-on-AITER is feasible **only at the kernel level, with hand-shrunk
 shapes**, not at the test-suite level. Concretely:
 
-1. Pick a single Triton kernel from `aiter/aiter/ops/triton/`.
+1. Pick a single Triton kernel from `benchmarks/aiter/aiter/aiter/ops/triton/`.
 2. Copy it into `extracted_kernels/`.
 3. Write a tiny driver that allocates **small** tensors inside the pool.
 4. Run via `python run_with_gsan.py extracted_kernels/<your>.py`.

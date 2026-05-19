@@ -2,9 +2,11 @@
 name = "race-detector-experiments"
 version = "0.0.0"
 requires-python = ">=3.11,<3.13"
-# Only pure-Python deps that uv.lock can lock.
-# torch, triton, and aiter are handled by scripts/setup_cuda_gsan.sh
-# (CUDA wheel index, source build, PYTHONPATH respectively).
+# Everything except aiter goes through uv:
+#   - pure-Python deps from PyPI (pytest, pandas, ...)
+#   - triton + triton-viz pinned to local submodule paths ([tool.uv.sources])
+#   - torch via the `cuda` (or `rocm`) extra and the PyTorch wheel index
+# aiter is a benchmark, not a dep — run.py mounts it via PYTHONPATH.
 dependencies = [
   "pybind11>=3.0.1",
   "ninja",
@@ -15,10 +17,51 @@ dependencies = [
   "pytest",
   "pytest-xdist",
   "pytest-timeout",
+  "triton-viz",
+  "triton",
 ]
 
+[project.optional-dependencies]
+cuda = [
+    "torch==2.9.0+cu128",
+]
+rocm = [
+    "torch",
+]
+
+[tool.uv]
+conflicts = [
+    [
+        { extra = "cuda" },
+        { extra = "rocm" },
+    ],
+]
+# Triton needs torch installed at build time; uv's default build isolation
+# would hide it. third_party/triton requires this to build successfully.
+no-build-isolation-package = ["triton"]
+# torch wheels hard-pin triton to a specific PyPI version (e.g. 2.9.0+cu128
+# pins triton==3.5.0). We override that constraint so the resolver accepts
+# triton==3.7.0 from our local path source (which has the GSan feature the
+# whole repo is built around).
+override-dependencies = [
+    "triton==3.7.0",
+]
+
+[tool.uv.sources]
+triton-viz = { path = "./third_party/triton-viz" }
+triton     = { path = "./third_party/triton", editable = true }
+torch = [
+    { index = "pytorch-cu128", extra = "cuda" },
+]
+
+[[tool.uv.index]]
+name = "pytorch-cu128"
+url = "https://download.pytorch.org/whl/cu128"
+explicit = true
+
 # Anchor pytest's rootdir at this file so the repo-level conftest.py
-# (which sets up GSan) is always picked up, even when running tests inside aiter/.
+# (which sets up the race detector) is always picked up, even when running
+# tests inside benchmarks/<name>/.
 [tool.pytest.ini_options]
-testpaths = ["aiter/op_tests/triton_tests"]
+testpaths = ["benchmarks/aiter/aiter/op_tests/triton_tests"]
 addopts = "--continue-on-collection-errors"

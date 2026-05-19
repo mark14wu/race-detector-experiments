@@ -28,17 +28,17 @@ variants.
 ## Full repo-relative paths
 
 ```
-aiter/op_tests/triton_tests/test_causal_conv1d.py
-aiter/op_tests/triton_tests/normalization/test_fused_add_rmsnorm_pad.py
-aiter/op_tests/triton_tests/attention/test_unified_attention_sparse_mla.py
-aiter/op_tests/triton_tests/normalization/test_rmsnorm.py
-aiter/op_tests/triton_tests/test_gated_delta_rule.py
-aiter/op_tests/triton_tests/normalization/test_layernorm.py
-aiter/op_tests/triton_tests/test_topk.py
-aiter/op_tests/triton_tests/attention/test_prefill_attention.py
-aiter/op_tests/triton_tests/moe/test_moe_align_block_size.py
-aiter/op_tests/triton_tests/attention/test_pa_prefill.py
-aiter/op_tests/triton_tests/attention/test_chunked_pa_prefill.py
+benchmarks/aiter/aiter/op_tests/triton_tests/test_causal_conv1d.py
+benchmarks/aiter/aiter/op_tests/triton_tests/normalization/test_fused_add_rmsnorm_pad.py
+benchmarks/aiter/aiter/op_tests/triton_tests/attention/test_unified_attention_sparse_mla.py
+benchmarks/aiter/aiter/op_tests/triton_tests/normalization/test_rmsnorm.py
+benchmarks/aiter/aiter/op_tests/triton_tests/test_gated_delta_rule.py
+benchmarks/aiter/aiter/op_tests/triton_tests/normalization/test_layernorm.py
+benchmarks/aiter/aiter/op_tests/triton_tests/test_topk.py
+benchmarks/aiter/aiter/op_tests/triton_tests/attention/test_prefill_attention.py
+benchmarks/aiter/aiter/op_tests/triton_tests/moe/test_moe_align_block_size.py
+benchmarks/aiter/aiter/op_tests/triton_tests/attention/test_pa_prefill.py
+benchmarks/aiter/aiter/op_tests/triton_tests/attention/test_chunked_pa_prefill.py
 ```
 
 ## How to use this list
@@ -58,7 +58,7 @@ aiter/op_tests/triton_tests/attention/test_chunked_pa_prefill.py
 
 - **Reproducing one file end-to-end**:
   ```bash
-  python run.py --backend baseline   aiter/op_tests/triton_tests/normalization/test_rmsnorm.py
-  python run.py --backend gsan       aiter/op_tests/triton_tests/normalization/test_rmsnorm.py
-  python run.py --backend triton_viz aiter/op_tests/triton_tests/normalization/test_rmsnorm.py
+  python run.py --backend baseline   benchmarks/aiter/aiter/op_tests/triton_tests/normalization/test_rmsnorm.py
+  python run.py --backend gsan       benchmarks/aiter/aiter/op_tests/triton_tests/normalization/test_rmsnorm.py
+  python run.py --backend triton_viz benchmarks/aiter/aiter/op_tests/triton_tests/normalization/test_rmsnorm.py
   ```

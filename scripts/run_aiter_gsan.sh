@@ -35,7 +35,7 @@ echo "=== gsan: $total files, $PER_FILE_TIMEOUT s/file cap, start $(date +%H:%M:
 while IFS= read -r f; do
     i=$((i + 1))
     echo "[$i/$total] $f  $(date +%H:%M:%S)" | tee -a "$PROGRESS_LOG"
-    timeout "$PER_FILE_TIMEOUT" python run.py --backend gsan "$f" \
+    timeout "$PER_FILE_TIMEOUT" python run.py --benchmark aiter --backend gsan "$f" \
         </dev/null >/dev/null 2>&1
     rc=$?
     echo "  -> exit=$rc  $(date +%H:%M:%S)" | tee -a "$PROGRESS_LOG"
